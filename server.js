@@ -105,13 +105,7 @@ ${answersText}
 - ${basicInfo.occupation === '学生' || basicInfo.occupation === '大学生' || basicInfo.occupation === '専門学生' ? '学生向け' : '社会人向け'}のアドバイスを提供してください
 reason・careerAdviceなどの文章内に "（ダブルクォート）を絶対に含めないでください
 すべて自然な日本語で出力してください
-- 出力は必ずJSONのみ
-- ``は禁止
-- 途中で文章を終わらせない
-- JSONは必ず最後まで閉じる
-- reasonは80文字以内
-- 余計な説明は禁止
-- もし長くなる場合は必ず短くしてでもJSONを完成させる`;
+JSON以外は絶対に出力しないでください`;
 }
 
 function buildPRPrompt(diagnosisResult, userData) {
@@ -152,7 +146,12 @@ ${diagnosisResult.suitableJobs.slice(0, 3).map(j => j.title).join('、')}
 ・必ず { から } まで完結させること
 ・reasonは最大80文字以内
 ・careerAdviceは150文字以内
-・JSON全体を短くすること`;
+・JSON全体を短くすること
+【絶対ルール】
+- 出力はJSONのみ（1文字目は{、最後は}）
+- 説明文禁止
+- 途中でも必ずJSONを完成させる
+- もし長い場合は内容を短くしてでもJSONを壊さない`;
 }
 
 app.post('/api/diagnose', async (req, res) => {
@@ -186,7 +185,7 @@ app.post('/api/diagnose', async (req, res) => {
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 8192
+          maxOutputTokens: 4096
         }
       })
     });
@@ -287,7 +286,7 @@ app.post('/api/generate-pr', async (req, res) => {
           temperature: 0.1,
           topK: 40,
           topP: 0.95,
-          maxOutputTokens: 8192,
+          maxOutputTokens: 4096,
         }
       })
     });
