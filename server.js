@@ -105,7 +105,13 @@ ${answersText}
 - ${basicInfo.occupation === '学生' || basicInfo.occupation === '大学生' || basicInfo.occupation === '専門学生' ? '学生向け' : '社会人向け'}のアドバイスを提供してください
 reason・careerAdviceなどの文章内に "（ダブルクォート）を絶対に含めないでください
 すべて自然な日本語で出力してください
-JSON以外は絶対に出力しないでください`;
+- 出力は必ずJSONのみ
+- ``は禁止
+- 途中で文章を終わらせない
+- JSONは必ず最後まで閉じる
+- reasonは80文字以内
+- 余計な説明は禁止
+- もし長くなる場合は必ず短くしてでもJSONを完成させる`;
 }
 
 function buildPRPrompt(diagnosisResult, userData) {
@@ -179,8 +185,8 @@ app.post('/api/diagnose', async (req, res) => {
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
-          temperature: 0.3,
-          maxOutputTokens: 4096
+          temperature: 0.1,
+          maxOutputTokens: 8192
         }
       })
     });
@@ -278,10 +284,10 @@ app.post('/api/generate-pr', async (req, res) => {
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
-          temperature: 0.3,
+          temperature: 0.1,
           topK: 40,
           topP: 0.95,
-          maxOutputTokens: 4096,
+          maxOutputTokens: 8192,
         }
       })
     });
