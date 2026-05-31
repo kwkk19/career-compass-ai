@@ -15,11 +15,71 @@ const limiter = rateLimit({
   max: 30,
   message: { error: 'rate_limit', message: '本日の診断上限に達しました。時間をおいて再度お試しください。' }
 });
-
 app.use('/api/', limiter);
 
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
 
+// ─── JSON修復ユーティリティ ──────────────────────────────
+// 途中で切れたJSONを可能な限り補完してparseする
+function robustJsonParse(raw) {
+  // 1. コードブロック除去
+  let text = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+  // 2. { ... } の範囲を抽出
+  const first = text.indexOf('{');
+  if (first === -1) throw new Error('No JSON object found');
+  text = text.slice(first);
+
+  // 3. まずそのままparseを試みる
+  try { return JSON.parse(text); } catch (_) {}
+
+  // 4. 途中で切れている場合の修復処理
+  text = repairTruncatedJson(text);
+  return JSON.parse(text);
+}
+
+function repairTruncatedJson(text) {
+  // 文字列の途中で切れている場合、閉じクォートを追加
+  // 開いている [ ] { } の数を数えて閉じる
+  let result = text;
+
+  // 末尾の不完全なキー・値を除去（カンマや : の後で切れている場合）
+  result = result.replace(/,\s*$/, '');           // 末尾の余分なカンマ
+  result = result.replace(/:\s*$/, ': null');      // 値がない場合
+  result = result.replace(/:\s*"[^"]*$/, ': ""'); // 途中の文字列
+
+  // 開いているブラケット・ブレースを閉じる
+  const opens = [];
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < result.length; i++) {
+    const c = result[i];
+    if (escape) { escape = false; continue; }
+    if (c === '\\' && inString) { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c === '{' || c === '[') opens.push(c);
+    if (c === '}' || c === ']') opens.pop();
+  }
+
+  // 文字列が開きっぱなしなら閉じる
+  if (inString) result += '"';
+
+  // 末尾の不完全なカンマを除去（再度）
+  result = result.replace(/,\s*$/, '');
+  result = result.replace(/,(\s*[}\]])/, '$1');
+
+  // 開いているブラケット・ブレースを逆順に閉じる
+  for (let i = opens.length - 1; i >= 0; i--) {
+    result += opens[i] === '{' ? '}' : ']';
+  }
+
+  return result;
+}
+
+// ─── 診断プロンプト ───────────────────────────────────────
+// ポイント：理由文を短く制限、全体のJSON出力量を最小化
 function buildDiagnosisPrompt(userData) {
   const { basicInfo, answers, freeText } = userData;
 
@@ -46,137 +106,62 @@ function buildDiagnosisPrompt(userData) {
     "クリエイティブな表現や制作活動に喜びを感じる"
   ];
 
-  const answerLabels = ['全く当てはまらない', 'あまり当てはまらない', 'どちらでもない', 'やや当てはまる', 'とても当てはまる'];
-
+  const answerLabels = ['全くN', 'あまりN', 'どちらでも', 'ややY', 'とてもY'];
   const answersText = answers.map((ans, i) =>
-    `Q${i + 1}. ${questionTexts[i]}: ${answerLabels[ans - 1]}（${ans}/5）`
-  ).join('\n');
+    `Q${i+1}:${ans}`
+  ).join(' ');
 
-  return `あなたはプロのキャリアアドバイザー兼適職診断AIです。以下のユーザー情報と診断回答を元に、詳細で実用的な適職診断を行ってください。
+  const isStudent = basicInfo.occupation.includes('学生');
 
-【ユーザー基本情報】
-・年齢: ${basicInfo.age}歳
-・性別: ${basicInfo.gender || '未回答'}
-・最終学歴: ${basicInfo.education}
-・現在の職業: ${basicInfo.occupation}
-・勤続年数: ${basicInfo.yearsOfService}
+  return `キャリア診断AIです。以下のデータを分析し、指定JSONのみ出力してください。
 
-【適性診断回答 (1=全く当てはまらない 〜 5=とても当てはまる)】
-${answersText}
+基本情報: 年齢${basicInfo.age}歳 / ${basicInfo.gender||'性別未回答'} / ${basicInfo.education} / ${basicInfo.occupation} / 勤続${basicInfo.yearsOfService}
+回答(1-5): ${answersText}
+得意: ${freeText.strengths||'未記入'}
+苦手: ${freeText.weaknesses||'未記入'}
+将来: ${freeText.futureGoals||'未記入'}
+避けたい環境: ${freeText.avoidEnvironment||'未記入'}
+理想の働き方: ${freeText.idealWorkStyle||'未記入'}
 
-【自由記述】
-・得意なこと: ${freeText.strengths || '未記入'}
-・苦手なこと: ${freeText.weaknesses || '未記入'}
-・将来やりたいこと: ${freeText.futureGoals || '未記入'}
-・働きたくない環境: ${freeText.avoidEnvironment || '未記入'}
-・理想の働き方: ${freeText.idealWorkStyle || '未記入'}
+出力ルール:
+- JSONのみ出力（説明文・コードブロック禁止）
+- 文字列内にダブルクォート禁止
+- 各reasonは40文字以内
+- careerAdviceは100文字以内
+- ${isStudent ? '学生向け' : '社会人向け'}アドバイス
 
-上記の情報を総合的に分析して、以下のJSON形式で回答してください。JSONのみを返してください。マークダウンや追加テキストは不要です。
-
-{
-  "suitableJobs": [
-    {
-      "rank": 1,
-      "title": "職業名",
-      "score": 94,
-      "reason": "この職業に向いている詳細な理由（100文字以上）"
-    }
-  ],
-  "unsuitableJobs": [
-    {
-      "rank": 1,
-      "title": "職業名",
-      "reason": "この職業に向いていない理由（50文字以上）"
-    }
-  ],
-  "strengths": ["強み1", "強み2", "強み3", "強み4", "強み5"],
-  "weaknesses": ["弱み1", "弱み2", "弱み3"],
-  "workStyles": ["向いている働き方1", "向いている働き方2", "向いている働き方3"],
-  "careerAdvice": "学生向けまたは社会人向けの具体的なキャリアアドバイス（100文字以上）",
-  "personalityType": "あなたのパーソナリティタイプ名（10文字以内）",
-  "personalityDescription": "パーソナリティタイプの説明（80文字程度）"
+{"suitableJobs":[{"rank":1,"title":"職業名","score":94,"reason":"理由40文字以内"},{"rank":2,"title":"職業名","score":88,"reason":"理由40文字以内"},{"rank":3,"title":"職業名","score":82,"reason":"理由40文字以内"}],"unsuitableJobs":[{"rank":1,"title":"職業名","reason":"理由30文字以内"},{"rank":2,"title":"職業名","reason":"理由30文字以内"},{"rank":3,"title":"職業名","reason":"理由30文字以内"}],"strengths":["強み1","強み2","強み3","強み4","強み5"],"weaknesses":["弱み1","弱み2","弱み3"],"workStyles":["働き方1","働き方2","働き方3"],"careerAdvice":"100文字以内のアドバイス","personalityType":"タイプ名10文字以内","personalityDescription":"説明50文字以内"}`;
 }
 
-注意事項:
-- suitableJobsは必ずTOP3（3件）を返してください
-- unsuitableJobsは必ずTOP3（3件）を返してください
-- scoreは60〜99の範囲で、現実的な数値にしてください
-- 理由は具体的で説得力のある内容にしてください
-- ${basicInfo.occupation === '学生' || basicInfo.occupation === '大学生' || basicInfo.occupation === '専門学生' ? '学生向け' : '社会人向け'}のアドバイスを提供してください
-reason・careerAdviceなどの文章内に "（ダブルクォート）を絶対に含めないでください
-すべて自然な日本語で出力してください
-JSON以外は絶対に出力しないでください`;
-}
-
+// ─── 自己PRプロンプト ─────────────────────────────────────
 function buildPRPrompt(diagnosisResult, userData) {
   const { basicInfo, freeText } = userData;
+  return `キャリアコーチです。以下を元に自己PRをJSON形式で出力してください。
 
-  return `あなたはプロのキャリアコーチです。以下の適職診断結果と個人情報を元に、就職・転職活動で使える自己PRを生成してください。
+職業:${basicInfo.occupation} / 学歴:${basicInfo.education} / 年齢:${basicInfo.age}歳
+強み:${diagnosisResult.strengths.join('、')}
+得意:${freeText.strengths||'未記入'}
+将来:${freeText.futureGoals||'未記入'}
+適職TOP3:${diagnosisResult.suitableJobs.slice(0,3).map(j=>j.title).join('、')}
 
-【基本情報】
-・年齢: ${basicInfo.age}歳
-・職業: ${basicInfo.occupation}
-・最終学歴: ${basicInfo.education}
+ルール: JSONのみ / 文字列内にダブルクォート禁止 / prTextは200文字以内 / interviewTipsは80文字以内
 
-【診断結果の強み】
-${diagnosisResult.strengths.join('、')}
-
-【得意なこと】
-${freeText.strengths || '未記入'}
-
-【将来やりたいこと】
-${freeText.futureGoals || '未記入'}
-
-【理想の働き方】
-${freeText.idealWorkStyle || '未記入'}
-
-【向いている職業TOP3】
-${diagnosisResult.suitableJobs.slice(0, 3).map(j => j.title).join('、')}
-
-以下のJSON形式のみで回答してください。マークダウンや追加テキストは不要です。
-
-{
-  "prText": "就職・転職活動で使える自己PR本文（300〜400文字）",
-  "keyStrengths": ["アピールポイント1", "アピールポイント2", "アピールポイント3"],
-  "interviewTips": "面接での効果的な伝え方のアドバイス（150文字以上）"
-}
-・JSONは必ず完全な形で出力すること
-・途中で切れる場合は短くしてでも完全なJSONにすること
-・改行・説明・コードブロックは禁止
-・必ず { から } まで完結させること
-・reasonは最大80文字以内
-・careerAdviceは150文字以内
-・JSON全体を短くすること
-【絶対ルール】
-- 出力はJSONのみ（1文字目は{、最後は}）
-- 説明文禁止
-- 途中でも必ずJSONを完成させる
-- もし長い場合は内容を短くしてでもJSONを壊さない`;
+{"prText":"自己PR200文字以内","keyStrengths":["強み1","強み2","強み3"],"interviewTips":"面接アドバイス80文字以内"}`;
 }
 
+// ─── /api/diagnose ────────────────────────────────────────
 app.post('/api/diagnose', async (req, res) => {
   try {
-    console.log("🔥 diagnose START");
-
+    console.log('🔥 diagnose START');
     const { userData } = req.body;
-
-    console.log("📦 userData:", JSON.stringify(userData, null, 2));
-
     const apiKey = process.env.GEMINI_API_KEY;
 
-    console.log("🔑 API KEY exists:", !!apiKey);
-
     if (!apiKey) {
-      console.log("❌ API KEY missing");
-      return res.status(500).json({
-        success: false,
-        error: "no_api_key"
-      });
+      return res.status(500).json({ success: false, error: 'no_api_key', message: 'APIキーが設定されていません。' });
     }
 
     const prompt = buildDiagnosisPrompt(userData);
-
-    console.log("📨 calling Gemini...");
+    console.log('📨 Gemini呼び出し中...');
 
     const response = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
       method: 'POST',
@@ -185,94 +170,76 @@ app.post('/api/diagnose', async (req, res) => {
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 4096
+          maxOutputTokens: 8192,
+          thinkingConfig: {
+            thinkingBudget: 0
+          }
         }
       })
     });
 
-    console.log("📡 Gemini status:", response.status);
+    console.log('📡 Gemini status:', response.status);
+
+    if (response.status === 429) {
+      return res.status(429).json({ success: false, error: 'rate_limit', message: '本日の診断上限に達しました。時間をおいて再度お試しください。' });
+    }
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('Gemini error:', errText);
+      return res.status(500).json({ success: false, error: 'api_error', message: '診断の実行に失敗しました。時間をおいて再度お試しください。' });
+    }
 
     const data = await response.json();
-
-    console.log("📩 Gemini raw response:", JSON.stringify(data, null, 2));
-
     const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    console.log("🧾 rawText:", rawText);
+    console.log('🧾 rawText length:', rawText?.length);
 
     if (!rawText) {
-      console.log("❌ rawText empty");
-
-      return res.status(500).json({
-        success: false,
-        error: "empty_response"
-      });
+      return res.status(500).json({ success: false, error: 'empty_response', message: '診断結果の取得に失敗しました。時間をおいて再度お試しください。' });
     }
 
-  let result;
+    // finishReasonチェック（MAX_TOKENSの場合でも修復を試みる）
+    const finishReason = data?.candidates?.[0]?.finishReason;
+    console.log('📋 finishReason:', finishReason);
 
-  try {
-    console.log("🧹 rawText BEFORE:", rawText);
-
-    // 余計なコードブロック除去
-    let cleaned = rawText;
-
-    // 1. コードブロック削除
-    cleaned = cleaned.replace(/```json/g, '').replace(/```/g, '').trim();
-
-    // 2. JSON部分だけ抜き出す（超重要）
-    const first = cleaned.indexOf('{');
-    const last = cleaned.lastIndexOf('}');
-
-    if (first === -1 || last === -1) {
-      throw new Error('JSON not found');
+    let result;
+    try {
+      result = robustJsonParse(rawText);
+      console.log('✅ JSON parse成功');
+    } catch (e) {
+      console.error('❌ JSON parse失敗:', e.message);
+      console.error('RAW:', rawText);
+      return res.status(500).json({ success: false, error: 'json_parse_error', message: '診断結果の解析に失敗しました。時間をおいて再度お試しください。' });
     }
 
-    cleaned = cleaned.slice(first, last + 1);
+    // 必須フィールドのフォールバック補完（修復後に不足している場合）
+    result.suitableJobs   = result.suitableJobs   || [];
+    result.unsuitableJobs = result.unsuitableJobs || [];
+    result.strengths      = result.strengths      || [];
+    result.weaknesses     = result.weaknesses     || [];
+    result.workStyles     = result.workStyles     || [];
+    result.careerAdvice   = result.careerAdvice   || 'あなたの強みを活かしたキャリアを目指してください。';
+    result.personalityType        = result.personalityType        || '分析中';
+    result.personalityDescription = result.personalityDescription || '';
 
-    // 3. parse
-    result = JSON.parse(cleaned);
-
-  } catch (e) {
-    console.log("❌ JSON PARSE ERROR");
-    console.log("RAW:", rawText);
-
-    return res.status(500).json({
-      success: false,
-      error: "json_parse_error",
-      raw: rawText
-    });
-  }
-
-    console.log("✅ SUCCESS");
-
-    return res.json({
-      success: true,
-      result
-    });
+    return res.json({ success: true, result });
 
   } catch (err) {
-    console.error("💥 FATAL ERROR:", err);
-
-    return res.status(500).json({
-      success: false,
-      error: "fatal_error",
-      message: err.message
-    });
+    console.error('💥 FATAL:', err);
+    return res.status(500).json({ success: false, error: 'fatal_error', message: '診断の実行に失敗しました。時間をおいて再度お試しください。' });
   }
 });
 
+// ─── /api/generate-pr ─────────────────────────────────────
 app.post('/api/generate-pr', async (req, res) => {
   try {
     const { diagnosisResult, userData } = req.body;
-
     if (!diagnosisResult || !userData) {
-      return res.status(400).json({ error: 'invalid_data', message: '入力データが不正です。' });
+      return res.status(400).json({ success: false, message: '入力データが不正です。' });
     }
 
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
-      return res.status(500).json({ error: 'config_error', message: 'サーバー設定エラーが発生しました。' });
+      return res.status(500).json({ success: false, message: 'サーバー設定エラーが発生しました。' });
     }
 
     const prompt = buildPRPrompt(diagnosisResult, userData);
@@ -283,40 +250,47 @@ app.post('/api/generate-pr', async (req, res) => {
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
-          temperature: 0.1,
-          topK: 40,
-          topP: 0.95,
-          maxOutputTokens: 4096,
+          temperature: 0.2,
+          maxOutputTokens: 8192,
+          thinkingConfig: {
+            thinkingBudget: 0
+          }
         }
       })
     });
 
     if (response.status === 429) {
-      return res.status(429).json({ error: 'rate_limit', message: '本日の上限に達しました。時間をおいて再度お試しください。' });
+      return res.status(429).json({ success: false, message: '本日の上限に達しました。時間をおいて再度お試しください。' });
     }
-
     if (!response.ok) {
-      return res.status(500).json({ error: 'api_error', message: '自己PRの生成に失敗しました。時間をおいて再度お試しください。' });
+      return res.status(500).json({ success: false, message: '自己PRの生成に失敗しました。時間をおいて再度お試しください。' });
     }
 
     const data = await response.json();
-    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
+    const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawText) {
-      return res.status(500).json({ error: 'parse_error', message: '自己PRの取得に失敗しました。' });
+      return res.status(500).json({ success: false, message: '自己PRの取得に失敗しました。' });
     }
 
-    const cleaned = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const result = JSON.parse(cleaned);
+    let result;
+    try {
+      result = robustJsonParse(rawText);
+    } catch (e) {
+      return res.status(500).json({ success: false, message: '自己PRの解析に失敗しました。時間をおいて再度お試しください。' });
+    }
 
-    res.json({ success: true, result });
+    result.prText       = result.prText       || '';
+    result.keyStrengths = result.keyStrengths || [];
+    result.interviewTips = result.interviewTips || '';
+
+    return res.json({ success: true, result });
 
   } catch (error) {
     console.error('PR generation error:', error);
-    res.status(500).json({ error: 'server_error', message: '自己PRの生成に失敗しました。時間をおいて再度お試しください。' });
+    return res.status(500).json({ success: false, message: '自己PRの生成に失敗しました。時間をおいて再度お試しください。' });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Career Compass AI server running on port ${PORT}`);
+  console.log(`Career Compass AI running on port ${PORT}`);
 });
